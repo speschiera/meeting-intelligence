@@ -387,6 +387,7 @@ const state = {
   lastSketch:null,
   timerInterval:null, timerSeconds:0,
   analysisQueue:[], isAnalyzing:false,
+  mediaRecorder:null, mediaStream:null, chunkBuffer:[],
   recognition:null, currentView:'map', sketchTimer:null,
 };
 
@@ -498,28 +499,24 @@ function stopAgent() {
   document.getElementById('stop-btn').disabled = true;
   updateFab();
 }
+// ── LIVE RECORDING via MediaRecorder + Groq Whisper ──
+// Usa MediaRecorder (funziona su tutti i domini HTTPS incluso github.io)
+// Ogni CHUNK_SEC secondi il chunk audio viene trascritto da Whisper e analizzato.
 
-// ── LIVE RECORDING (Web Speech API) ──
+const CHUNK_SEC = 15; // secondi per chunk — bilancia latenza vs qualità
+
 function toggleRecording() { if (state.isRecording) stopRecording(); else startRecording(); }
 
 async function startRecording() {
-  if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-    alert('Speech Recognition non supportato in questo browser.\nUsa Chrome o Edge, oppure usa la modalità Upload File.');
-    return;
-  }
-
-  // Richiedi permesso microfono esplicitamente — così il browser mostra il prompt
   setStatus('permesso mic…', 'uploading');
-  const fabLabel = document.getElementById('record-fab-label');
-  fabLabel.textContent = 'autorizza il microfono…';
+  document.getElementById('record-fab-label').textContent = 'autorizza il microfono…';
 
+  let stream;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // Permesso ottenuto — rilascia subito lo stream (lo gestirà SpeechRecognition)
-    stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch(err) {
     const msg = err.name === 'NotAllowedError'
-      ? 'Microfono bloccato.\nVai su Impostazioni sito → Microfono → Consenti, poi ricarica.'
+      ? 'Microfono bloccato.\nClicca sul lucchetto nella barra URL → Microfono → Consenti.'
       : 'Impossibile accedere al microfono: ' + err.message;
     alert(msg);
     setStatus('errore mic', 'default');
@@ -527,78 +524,122 @@ async function startRecording() {
     return;
   }
 
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const rec = new SR();
-  const langMap = { it:'it-IT', en:'en-US', fr:'fr-FR', de:'de-DE', es:'es-ES', pt:'pt-PT' };
-  rec.lang = langMap[state.lang] || 'it-IT';
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.maxAlternatives = 1;
+  // Scegli il formato supportato
+  const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4']
+    .find(m => MediaRecorder.isTypeSupported(m)) || '';
 
-  rec.onstart = () => {
-    state.isRecording = true;
-    document.getElementById('rec-btn').textContent = '■ Pausa';
-    document.getElementById('rec-btn').className = 'btn btn-danger';
-    setStatus('ascolto', 'active');
-    startTimer();
-    clearTranscript();
-    updateFab();
+  const mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+  state.mediaRecorder = mediaRecorder;
+  state.mediaStream = stream;
+  state.chunkBuffer = [];
+  state.isRecording = true;
+
+  // UI → recording
+  document.getElementById('rec-btn').textContent = '■ Pausa';
+  document.getElementById('rec-btn').className = 'btn btn-danger';
+  setStatus('ascolto', 'active');
+  startTimer();
+  clearTranscript();
+  updateFab();
+
+  // Accumula dati audio
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) state.chunkBuffer.push(e.data);
   };
 
-  rec.onresult = (e) => {
-    let interim = '', finalText = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) finalText += t; else interim += t;
-    }
-    if (finalText) {
-      addTranscriptLine(finalText, true);
-      state.pendingText += ' ' + finalText;
-      if (state.pendingText.trim().split(' ').length >= 20) {
-        queueAnalysis(state.pendingText.trim());
-        state.pendingText = '';
-      }
-    }
-    if (interim) updateInterimLine(interim);
-  };
+  // Flush chunk ogni CHUNK_SEC secondi
+  mediaRecorder.onstop = async () => {
+    if (state.chunkBuffer.length === 0) return;
+    const blob = new Blob(state.chunkBuffer, { type: mimeType || 'audio/webm' });
+    state.chunkBuffer = [];
+    await transcribeChunk(blob, mimeType);
 
-  rec.onerror = (e) => {
-    console.error('SpeechRecognition error:', e.error);
-    if (e.error === 'not-allowed') {
-      alert('Microfono non autorizzato. Controlla le impostazioni del browser.');
-      stopRecording();
-    } else if (e.error === 'network') {
-      setStatus('errore rete', 'default');
-    } else if (e.error !== 'no-speech') {
-      setStatus('errore: ' + e.error, 'default');
+    // Se stiamo ancora registrando, riparti con nuovo chunk
+    if (state.isRecording && state.mediaRecorder) {
+      state.mediaRecorder.start();
+      setTimeout(() => {
+        if (state.isRecording && state.mediaRecorder?.state === 'recording') {
+          state.mediaRecorder.stop();
+        }
+      }, CHUNK_SEC * 1000);
     }
   };
 
-  rec.onend = () => {
-    // Auto-restart solo se stiamo ancora registrando
-    if (state.isRecording) {
-      try { rec.start(); } catch(e) { console.warn('Restart failed:', e); }
+  // Avvia primo chunk
+  mediaRecorder.start();
+  setTimeout(() => {
+    if (state.isRecording && state.mediaRecorder?.state === 'recording') {
+      state.mediaRecorder.stop();
     }
-  };
+  }, CHUNK_SEC * 1000);
+}
+
+async function transcribeChunk(blob, mimeType) {
+  // Estensione dal mimeType
+  const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
+  const filename = `chunk.${ext}`;
+
+  // Mostra indicatore "trascrizione…" nella transcript
+  updateInterimLine('⏳ trascrizione chunk…');
+
+  const formData = new FormData();
+  formData.append('file', blob, filename);
+  formData.append('model', 'whisper-large-v3');
+  formData.append('response_format', 'text');
+  formData.append('language', state.lang);
 
   try {
-    rec.start();
-    state.recognition = rec;
+    const res = await fetch(GROQ_WHISPER, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${state.groqKey}` },
+      body: formData
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.error('Whisper error:', err);
+      setStatus('errore whisper', 'default');
+      return;
+    }
+
+    const text = (await res.text()).trim();
+    if (!text || text.length < 3) return; // chunk silenzioso
+
+    // Rimuovi indicatore e aggiungi testo reale
+    const el = document.getElementById('live-transcript');
+    const interim = el.querySelector('.interim'); if (interim) interim.remove();
+
+    addTranscriptLine(text, true);
+    state.pendingText += ' ' + text;
+
+    // Analizza se abbiamo abbastanza testo
+    if (state.pendingText.trim().split(' ').length >= 15) {
+      queueAnalysis(state.pendingText.trim());
+      state.pendingText = '';
+    }
+
   } catch(e) {
-    alert('Errore avvio registrazione: ' + e.message);
-    setStatus('errore', 'default');
-    updateFab();
+    console.error('transcribeChunk error:', e);
+    setStatus('errore rete', 'default');
   }
 }
 
 function stopRecording() {
-  if (state.recognition) { state.recognition.stop(); state.recognition=null; }
   state.isRecording = false;
+
+  if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+    state.mediaRecorder.stop(); // triggers onstop → flush finale
+  }
+  if (state.mediaStream) {
+    state.mediaStream.getTracks().forEach(t => t.stop());
+    state.mediaStream = null;
+  }
+  state.mediaRecorder = null;
+
   document.getElementById('rec-btn').textContent = '● Avvia';
   document.getElementById('rec-btn').className = 'btn btn-primary';
-  setStatus('in pausa','default');
+  setStatus('in pausa', 'default');
   clearInterval(state.timerInterval);
-  if (state.pendingText.trim().length>10) { queueAnalysis(state.pendingText.trim()); state.pendingText=''; }
   updateFab();
 }
 
