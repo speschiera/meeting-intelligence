@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Meeting Intelligence</title>
+<title>Meeting Intelligence v4</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap');
 :root{--bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:rgba(255,255,255,0.06);--accent:#00e5ff;--accent2:#ff6b35;--accent3:#a855f7;--text:#e8e8f0;--text-dim:rgba(232,232,240,0.45)}
@@ -669,18 +669,25 @@ function scheduleChunk(mimeType) {
 }
 
 async function transcribeChunk(blob, mimeType) {
-  // Skip very small blobs (silence / mic glitch < 5KB)
-  if (blob.size < 5000) { console.log('Skipping tiny chunk:', blob.size); return; }
+  console.log('[Whisper] chunk size:', blob.size, 'bytes');
+
+  // Skip blobs too small to contain real speech (< 15KB ≈ < 1 sec of voice)
+  if (blob.size < 15000) {
+    console.log('[Whisper] skipping — blob too small (silence/noise)');
+    return;
+  }
 
   const ext = mimeType.includes('mp4')?'mp4':mimeType.includes('ogg')?'ogg':'webm';
   updateInterimLine('⏳ trascrizione…');
 
   const fd = new FormData();
   fd.append('file', blob, `chunk.${ext}`);
-  fd.append('model', 'whisper-large-v3');
-  fd.append('response_format', 'text');
+  fd.append('model', 'whisper-large-v3-turbo'); // turbo: faster, far fewer hallucinations
+  fd.append('response_format', 'verbose_json');  // gives us no_speech_prob
   fd.append('language', state.lang);
-  fd.append('temperature', '0');  // deterministic — eliminates hallucinations
+  fd.append('temperature', '0');
+  // Negative prompt: tell Whisper what NOT to produce
+  fd.append('prompt', 'Trascrivi esattamente ciò che viene detto. Non aggiungere nulla.');
 
   try {
     const res = await fetch(GROQ_WHISPER, {
@@ -688,15 +695,35 @@ async function transcribeChunk(blob, mimeType) {
       headers:{'Authorization':`Bearer ${state.groqKey}`},
       body:fd
     });
-    if (!res.ok) { console.error('Whisper HTTP', res.status, await res.text()); return; }
-    const text = (await res.text()).trim();
 
     // Remove interim placeholder
     const el = document.getElementById('live-transcript');
     const interim = el.querySelector('.interim'); if (interim) interim.remove();
 
-    // Filter Whisper hallucinations: repeated short phrases, non-speech artifacts
-    if (isHallucination(text)) { console.log('Filtered hallucination:', text); return; }
+    if (!res.ok) {
+      const err = await res.text();
+      console.error('[Whisper] HTTP error', res.status, err);
+      return;
+    }
+
+    const data = await res.json();
+    console.log('[Whisper] raw response:', data);
+
+    // Check no_speech_prob — if > 0.6 it's silence/noise, skip
+    const noSpeech = data.segments?.[0]?.no_speech_prob ?? 0;
+    console.log('[Whisper] no_speech_prob:', noSpeech);
+    if (noSpeech > 0.6) {
+      console.log('[Whisper] skipping — high no_speech_prob');
+      return;
+    }
+
+    const text = (data.text || '').trim();
+    console.log('[Whisper] text:', JSON.stringify(text));
+
+    if (isHallucination(text)) {
+      console.log('[Whisper] filtered hallucination:', JSON.stringify(text));
+      return;
+    }
 
     addTranscriptLine(text, true);
     state.pendingText += ' ' + text;
@@ -704,24 +731,31 @@ async function transcribeChunk(blob, mimeType) {
       queueAnalysis(state.pendingText.trim());
       state.pendingText = '';
     }
-  } catch(e) { console.error('transcribeChunk:', e); }
+  } catch(e) { console.error('[Whisper] error:', e); }
 }
 
-// Detect common Whisper hallucinations on silent audio
+// Detect Whisper hallucinations on silent/low-signal audio
 function isHallucination(text) {
-  if (!text || text.length < 2) return true;
-  const t = text.toLowerCase().trim();
-  // Common hallucinations on silence
-  const HALLUCINATIONS = [
-    'grazie','grazie.','grazie a tutti','grazie mille','prego','sottotitoli','sottotitolato',
-    'thank you','thanks','thanks for watching','you','you.','.',',',
-    'by miplaza','transcribed by','amara.org','caption','subtitles',
-    'www.','http','[music]','[applause]','[silence]','♪','sotto',
+  if (!text || text.trim().length < 2) return true;
+  const t = text.toLowerCase().trim().replace(/[.!?,]/g, '');
+
+  // Exact match blacklist
+  const BLACKLIST = [
+    'grazie','grazie a tutti','grazie mille','grazie per',
+    'prego','arrivederci','ciao','ok','okay',
+    'thank you','thanks','thanks for watching','you',
+    'sottotitoli','sottotitolato','sottotitoli a cura',
+    'by miplaza','amara.org','caption','subtitles',
+    'transcribed by','www','http','[music]','[applause]','[silence]','♪',
+    'iscriviti','subscribe','like','commenta',
   ];
-  if (HALLUCINATIONS.includes(t)) return true;
-  // Repeated pattern (e.g. "ah ah ah ah")
-  const words = t.split(/\s+/);
-  if (words.length <= 3 && new Set(words).size===1) return true;
+  if (BLACKLIST.some(b => t === b || t.startsWith(b+' '))) return true;
+
+  // Regex patterns
+  if (/^(ah+|eh+|uh+|mm+|hm+)\s*$/i.test(t)) return true;           // filler sounds
+  if (/^(.{1,20})\1{2,}$/.test(t)) return true;                       // repeated pattern
+  if (t.split(/\s+/).length <= 2 && t.length < 10) return true;       // too short
+
   return false;
 }
 
